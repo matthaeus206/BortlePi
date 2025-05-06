@@ -3,73 +3,94 @@ import board
 import busio
 import digitalio
 import adafruit_veml7700
+import supervisor
+import gc
 
-# Setup I2C for the VEML7700
-try:
-    i2c = busio.I2C(board.GP1, board.GP0)
-    veml7700 = adafruit_veml7700.VEML7700(i2c)
-except Exception as e:
-    print(f"Error initializing I2C or VEML7700: {e}")
-    veml7700 = None  # Continue without the sensor
+# Optional: Disable auto-reload for stability on some boards
+supervisor.disable_autoreload()
 
-# Setup LEDs with a dictionary for easier management
-led_pins = {
+# Constants
+BORTLE_THRESHOLDS = [
+    (0.01, 1), (0.08, 2), (0.3, 3),
+    (1.0, 4), (4.0, 5), (10.0, 6),
+    (30.0, 7), (100.0, 8)
+]
+
+LED_PINS = {
     "green": board.GP2,
     "yellow": board.GP4,
     "red": board.GP3,
 }
 
-leds = {}
-for color, pin in led_pins.items():
+def initialize_sensor():
     try:
-        led = digitalio.DigitalInOut(pin)
-        led.direction = digitalio.Direction.OUTPUT
-        leds[color] = led
+        i2c = board.I2C()  # Automatically uses correct pins
+        veml7700 = adafruit_veml7700.VEML7700(i2c)
+        print("VEML7700 initialized.")
+        return veml7700
     except Exception as e:
-        print(f"Error initializing {color} LED on pin {pin}: {e}")
+        print(f"Error initializing VEML7700: {e}")
+        return None
 
-# Function to map lux value to Bortle scale
+def initialize_leds():
+    leds = {}
+    for color, pin in LED_PINS.items():
+        try:
+            led = digitalio.DigitalInOut(pin)
+            led.direction = digitalio.Direction.OUTPUT
+            leds[color] = led
+        except Exception as e:
+            print(f"Error initializing {color} LED on pin {pin}: {e}")
+    return leds
+
 def get_bortle_scale(lux):
-    thresholds = [
-        (0.01, 1), (0.08, 2), (0.3, 3),
-        (1.0, 4), (4.0, 5), (10.0, 6),
-        (30.0, 7), (100.0, 8)
-    ]
-    for threshold, scale in thresholds:
+    for threshold, scale in BORTLE_THRESHOLDS:
         if lux < threshold:
             return scale
-    return 9
+    return 9  # Worst-case (brightest skies)
 
-# Function to update LEDs based on Bortle scale
-def update_leds(bortle_scale):
-    led_states = {
+def update_leds(bortle_scale, leds):
+    states = {
         "green": bortle_scale <= 3,
         "yellow": 4 <= bortle_scale <= 5,
         "red": bortle_scale >= 6,
     }
-    for color, state in led_states.items():
+    for color, state in states.items():
         if color in leds:
             leds[color].value = state
 
-while True:
-    try:
-        # Read ambient light level in lux
-        if veml7700:
-            lux = veml7700.lux
-        else:
-            lux = -1  # Fallback value when sensor is not initialized
-        print(f"Lux: {lux:.2f}" if lux >= 0 else "Lux: Sensor unavailable")
-        
-        # Determine Bortle scale
-        bortle_scale = get_bortle_scale(lux) if lux >= 0 else 9
-        print(f"Bortle Scale: {bortle_scale}")
-        
-        # Update LEDs based on Bortle scale
-        update_leds(bortle_scale)
+def main():
+    veml7700 = initialize_sensor()
+    leds = initialize_leds()
 
-    except Exception as e:
-        # Log the error and continue
-        print(f"Error during main loop: {e}")
+    while True:
+        try:
+            if veml7700:
+                try:
+                    lux = veml7700.lux
+                except Exception as e:
+                    print(f"Sensor read error: {e}")
+                    lux = -1
+            else:
+                lux = -1
 
-    # Wait for a second before reading again
-    time.sleep(1)
+            if lux >= 0:
+                print(f"Lux: {lux:.2f}")
+                bortle_scale = get_bortle_scale(lux)
+            else:
+                print("Lux: Sensor unavailable")
+                bortle_scale = 9
+
+            print(f"Bortle Scale: {bortle_scale}")
+            update_leds(bortle_scale, leds)
+
+            # Optional: Print free memory
+            print(f"Free memory: {gc.mem_free()} bytes")
+
+        except (OSError, RuntimeError, ValueError) as e:
+            print(f"Main loop error: {e}")
+
+        time.sleep(1)
+
+if __name__ == "__main__":
+    main()
