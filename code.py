@@ -1,96 +1,118 @@
 import time
 import board
-import busio
 import digitalio
-import adafruit_veml7700
 import supervisor
 import gc
+import adafruit_veml7700
+from collections import deque
+from typing import Optional, Dict
 
-# Optional: Disable auto-reload for stability on some boards
+# Disable auto-reload for stability
 supervisor.disable_autoreload()
 
-# Constants
+# --- CONFIGURATION ---
 BORTLE_THRESHOLDS = [
     (0.01, 1), (0.08, 2), (0.3, 3),
     (1.0, 4), (4.0, 5), (10.0, 6),
-    (30.0, 7), (100.0, 8)
+    (30.0, 7), (100.0, 8),
 ]
-
 LED_PINS = {
     "green": board.GP2,
     "yellow": board.GP4,
     "red": board.GP3,
 }
+READ_RETRY_LIMIT = 5           # tries before re-init sensor
+SMOOTH_WINDOW_SIZE = 5         # samples for moving average
+LOOP_INTERVAL = 1.0            # seconds between updates
 
-def initialize_sensor():
+# --- INITIALIZATION ---
+def init_sensor() -> Optional[adafruit_veml7700.VEML7700]:
+    """Initialize VEML7700 via board.I2C(); return None on failure."""
     try:
-        i2c = board.I2C()  # Automatically uses correct pins
-        veml7700 = adafruit_veml7700.VEML7700(i2c)
-        print("VEML7700 initialized.")
-        return veml7700
+        i2c = board.I2C()  # automatic pin assignment
+        sensor = adafruit_veml7700.VEML7700(i2c)
+        print("✔ VEML7700 initialized")
+        return sensor
     except Exception as e:
-        print(f"Error initializing VEML7700: {e}")
+        print(f"⚠ Sensor init failed: {e}")
         return None
 
-def initialize_leds():
-    leds = {}
+
+def init_leds() -> Dict[str, digitalio.DigitalInOut]:
+    """Setup LEDs; return dict of color→DigitalInOut."""
+    leds: Dict[str, digitalio.DigitalInOut] = {}
     for color, pin in LED_PINS.items():
         try:
-            led = digitalio.DigitalInOut(pin)
-            led.direction = digitalio.Direction.OUTPUT
-            leds[color] = led
+            d = digitalio.DigitalInOut(pin)
+            d.direction = digitalio.Direction.OUTPUT
+            d.value = False
+            leds[color] = d
         except Exception as e:
-            print(f"Error initializing {color} LED on pin {pin}: {e}")
+            print(f"⚠ LED init error ({color}): {e}")
     return leds
 
-def get_bortle_scale(lux):
+# --- BORTLE SCALE LOGIC ---
+def lux_to_bortle(lux: float) -> int:
+    """Map lux to Bortle scale (1–9)."""
     for threshold, scale in BORTLE_THRESHOLDS:
         if lux < threshold:
             return scale
-    return 9  # Worst-case (brightest skies)
+    return 9
 
-def update_leds(bortle_scale, leds):
-    states = {
-        "green": bortle_scale <= 3,
-        "yellow": 4 <= bortle_scale <= 5,
-        "red": bortle_scale >= 6,
-    }
-    for color, state in states.items():
-        if color in leds:
-            leds[color].value = state
+# --- SENSOR READING & LED UPDATE ---
+def read_lux(sensor: Optional[adafruit_veml7700.VEML7700],
+             retries: int = READ_RETRY_LIMIT) -> float:
+    """Attempt sensor.lux with retries; return -1 on complete failure."""
+    if sensor is None:
+        return -1.0
+    for attempt in range(1, retries + 1):
+        try:
+            return sensor.lux
+        except Exception as e:
+            print(f"  Read error #{attempt}: {e}")
+            time.sleep(0.1)
+    return -1.0
 
+
+def update_led_states(scale: int, leds: Dict[str, digitalio.DigitalInOut]) -> None:
+    """Set LED outputs based on the current Bortle scale."""
+    if "green" in leds:
+        leds["green"].value = (scale <= 3)
+    if "yellow" in leds:
+        leds["yellow"].value = (4 <= scale <= 5)
+    if "red" in leds:
+        leds["red"].value = (scale >= 6)
+
+# --- MAIN LOOP ---
 def main():
-    veml7700 = initialize_sensor()
-    leds = initialize_leds()
+    sensor = init_sensor()
+    leds = init_leds()
+    lux_history = deque(maxlen=SMOOTH_WINDOW_SIZE)
+    next_time = time.monotonic()
 
     while True:
-        try:
-            if veml7700:
-                try:
-                    lux = veml7700.lux
-                except Exception as e:
-                    print(f"Sensor read error: {e}")
-                    lux = -1
-            else:
-                lux = -1
+        lux = read_lux(sensor)
+        if lux < 0:
+            print("Lux: sensor unavailable → reinitializing")
+            sensor = init_sensor()
+        else:
+            lux_history.append(lux)
+            avg_lux = sum(lux_history) / len(lux_history)
+            print(f"Lux: {lux:.2f}  (avg {avg_lux:.2f})")
+            scale = lux_to_bortle(avg_lux)
+            print(f"Bortle scale: {scale}")
+            update_led_states(scale, leds)
 
-            if lux >= 0:
-                print(f"Lux: {lux:.2f}")
-                bortle_scale = get_bortle_scale(lux)
-            else:
-                print("Lux: Sensor unavailable")
-                bortle_scale = 9
+        print(f"Free RAM: {gc.mem_free()} bytes\n")
 
-            print(f"Bortle Scale: {bortle_scale}")
-            update_leds(bortle_scale, leds)
+        # maintain consistent loop timing
+        next_time += LOOP_INTERVAL
+        sleep_duration = next_time - time.monotonic()
+        if sleep_duration > 0:
+            time.sleep(sleep_duration)
+        else:
+            next_time = time.monotonic()
 
-            # Optional: Print free memory
-            print(f"Free memory: {gc.mem_free()} bytes")
-
-        except (OSError, RuntimeError, ValueError) as e:
-            print(f"Main loop error: {e}")
-
-        time.sleep(1)
 
 if __name__ == "__main__":
     main()
