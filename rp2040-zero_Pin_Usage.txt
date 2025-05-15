@@ -1,0 +1,24 @@
+RP2040-Zero Pin Usage – Bortle Scale Reader Project (Using VEML7700 Breakout)
+=============================================================================
+
+Sensor (VEML7700 Breakout)
+--------------------------
+Function           | VEML7700 Pin | Connect To (RP2040-Zero) | Notes
+------------------ | -------------|---------------------------|---------------------------------------------------------
+Power              | 3V3          | 3V3                       | Power for VEML7700 (3.3V regulated from RP2040-Zero)
+I2C SDA            | SDA          | GP0                       | Data line for I2C0 (GPIO0)
+I2C SCL            | SCL          | GP1                       | Clock line for I2C0 (GPIO1)
+Ground             | GND          | GND                       | Common ground
+VIN                | —            | (leave unconnected)       | Not used – only needed for 5V input (not applicable here)
+
+LED Indicators
+--------------
+Function           | Pin Label | GPIO  | Notes
+------------------ | ----------|-------|-------------------------------------------------------------
+Green LED          | GP2       | GPIO2 | ON when Bortle scale is 1–3
+Red LED            | GP3       | GPIO3 | ON when Bortle scale is 6–9
+Yellow LED         | GP4       | GPIO4 | ON when Bortle scale is 4–5
+
+Notes:
+- You are using 3.3V power only. Do not connect VIN on the VEML7700 breakout.
+- Ensure I2C pull-up resistors are present on the breakout board (most are).
