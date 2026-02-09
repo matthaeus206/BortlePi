@@ -1,295 +1,344 @@
-"""
-Sky Quality Meter for RP2040-Zero
-Measures light pollution using VEML7700 sensor
-"""
-import time
-import board
-import digitalio
-import busio
-import microcontroller
-import supervisor
-import gc
-from watchdog import WatchDogMode
-import adafruit_veml7700
-from collections import deque
+# main.py  (MicroPython)
+#
+# RP2350-Matrix + TSL25911 sky brightness -> Bortle 1..9
+# Display: background color (Bortle palette) + centered white digit
+#
+# Hardware assumptions:
+#   - WS2812 8x8 matrix data pin: GPIO25
+#   - I2C bus: SDA=GPIO6, SCL=GPIO7 (same pins Waveshare uses in their example)
+#   - TSL25911 I2C address: 0x29
+#
+# Notes:
+#   - This is "SQM-like", not a factory-calibrated photometer.
+#   - You WILL want to tune CAL_A and CAL_B after one or two reference nights.
 
-# ========== CONFIGURATION ==========
+import time, math
+from machine import I2C, Pin
+import neopixel
 
-# RP2040-Zero I2C pins
-I2C_SDA = board.GP0
-I2C_SCL = board.GP1
+# ----------------------------
+# User-tunable configuration
+# ----------------------------
 
-# LED indicators
-LED_GREEN = board.GP2   # Bortle 1-3 (excellent)
-LED_YELLOW = board.GP4  # Bortle 4-5 (moderate)
-LED_RED = board.GP3     # Bortle 6-9 (poor)
-HEARTBEAT_LED = board.GP25  # Onboard LED
+# Display brightness scaling (0.05..0.4 is sane at night)
+BG_BRIGHT = 0.18
+DIGIT_BRIGHT = 0.35
 
-# Bortle scale thresholds (lux -> scale)
-BORTLE_SCALE = [
-    (0.01, 1),   # Excellent dark sky
-    (0.08, 2),
-    (0.3, 3),
-    (1.0, 4),
-    (4.0, 5),
-    (10.0, 6),
-    (30.0, 7),
-    (100.0, 8),
-    (float('inf'), 9)  # Worst light pollution
-]
+# Calibration (SQM-like):
+#   sqm_est = CAL_A * log10(raw_brightness) + CAL_B
+#
+# Start values: reasonable-ish placeholders.
+# You'll tune these using a known site / reference device / known SQM app reading.
+CAL_A = -2.5
+CAL_B = 21.5
 
-# Timing & smoothing
-LOOP_INTERVAL = 1.0      # seconds between readings
-SMOOTH_WINDOW = 5        # rolling average window
-EMA_ALPHA = 0.3          # exponential moving average weight
+# Smoothing (EMA): closer to 1.0 = slower changes, less flicker
+EMA_ALPHA = 0.85
 
-# Error handling
-MAX_READ_RETRIES = 5
-MAX_INIT_FAILURES = 10
-WATCHDOG_TIMEOUT = 8.0
+# How often to update (seconds)
+UPDATE_PERIOD = 1.0
 
+# ----------------------------
+# RP2350-Matrix WS2812 config
+# ----------------------------
 
-# ========== HARDWARE SETUP ==========
+W, H = 8, 8
+NUM_LEDS = W * H
+LED_PIN = 25
+np = neopixel.NeoPixel(Pin(LED_PIN, Pin.OUT), NUM_LEDS)
 
-class Hardware:
-    """Manages all hardware initialization"""
-    
-    def __init__(self):
-        supervisor.disable_autoreload()
-        
-        # I2C bus (shared)
-        self.i2c = busio.I2C(scl=I2C_SCL, sda=I2C_SDA)
-        
-        # Watchdog for auto-recovery
-        microcontroller.watchdog.timeout = WATCHDOG_TIMEOUT
-        microcontroller.watchdog.mode = WatchDogMode.RESET
-        
-        # LEDs
-        self.leds = self._init_leds()
-        self.heartbeat = self._init_heartbeat()
-        
-        # Sensor
-        self.sensor = None
-        self.init_sensor()
-    
-    def _init_leds(self):
-        """Initialize RGB status LEDs"""
-        leds = {}
-        pins = {
-            'green': LED_GREEN,
-            'yellow': LED_YELLOW,
-            'red': LED_RED
-        }
-        
-        for color, pin in pins.items():
-            try:
-                led = digitalio.DigitalInOut(pin)
-                led.direction = digitalio.Direction.OUTPUT
-                led.value = False
-                leds[color] = led
-            except Exception as e:
-                print(f"⚠ LED init failed ({color}): {e}")
-        
-        return leds
-    
-    def _init_heartbeat(self):
-        """Initialize onboard LED for heartbeat"""
-        try:
-            led = digitalio.DigitalInOut(HEARTBEAT_LED)
-            led.direction = digitalio.Direction.OUTPUT
-            led.value = False
-            return led
-        except Exception as e:
-            print(f"⚠ Heartbeat LED failed: {e}")
-            return None
-    
-    def init_sensor(self):
-        """Initialize VEML7700 light sensor"""
-        try:
-            self.sensor = adafruit_veml7700.VEML7700(self.i2c)
-            
-            # Configure for dark sky measurement (CircuitPython 9.x API)
-            self.sensor.light_integration_time = 800  # ms
-            self.sensor.light_gain = 2.0              # gain multiplier
-            
-            print("✓ VEML7700 sensor initialized")
-            return True
-            
-        except Exception as e:
-            print(f"✗ Sensor init failed: {e}")
-            self.sensor = None
-            return False
-    
-    def heartbeat_blink(self):
-        """Quick heartbeat pulse"""
-        if self.heartbeat:
-            self.heartbeat.value = True
-            time.sleep(0.02)
-            self.heartbeat.value = False
-    
-    def set_leds(self, bortle_scale):
-        """Update LED states based on Bortle scale"""
-        self.leds.get('green', lambda: None).value = (bortle_scale <= 3)
-        self.leds.get('yellow', lambda: None).value = (4 <= bortle_scale <= 5)
-        self.leds.get('red', lambda: None).value = (bortle_scale >= 6)
+# Many matrices are wired serpentine. If your image is scrambled:
+#   - flip SERPENTINE
+#   - or flip X/Y
+SERPENTINE = True
+FLIP_X = False
+FLIP_Y = False
 
+def xy_to_i(x, y):
+    if FLIP_X:
+        x = (W - 1) - x
+    if FLIP_Y:
+        y = (H - 1) - y
+    if SERPENTINE and (y % 2 == 1):
+        x = (W - 1) - x
+    return y * W + x
 
-# ========== SENSOR READING ==========
+def scale(rgb, k):
+    return (int(rgb[0] * k), int(rgb[1] * k), int(rgb[2] * k))
 
-class LuxReader:
-    """Handles sensor reading with retries and smoothing"""
-    
-    def __init__(self, hardware):
-        self.hw = hardware
-        self.history = deque(maxlen=SMOOTH_WINDOW)
-        self.ema = None
-        self.failed_reads = 0
-    
-    def read(self):
-        """Read lux value with retry logic"""
-        if self.hw.sensor is None:
-            return None
-        
-        for attempt in range(1, MAX_READ_RETRIES + 1):
-            try:
-                lux = self.hw.sensor.lux
-                self.failed_reads = 0
-                return lux
-                
-            except Exception as e:
-                if attempt == MAX_READ_RETRIES:
-                    print(f"✗ Read failed after {attempt} attempts: {e}")
-                    self.failed_reads += 1
-                else:
-                    time.sleep(0.05 * attempt)  # Progressive backoff
-        
-        return None
-    
-    def smooth(self, lux):
-        """Apply smoothing to reduce noise"""
-        if lux is None:
-            return None
-        
-        # Update EMA
-        if self.ema is None:
-            self.ema = lux
+def fill(rgb, k=1.0):
+    c = scale(rgb, k)
+    for i in range(NUM_LEDS):
+        np[i] = c
+    np.write()
+
+# Your linked Bortle palette:
+# 1 black, 2 gray, 3 blue, 4 green, 5 yellow, 6 orange, 7 red, 8 pink, 9 white
+# (dimmed via BG_BRIGHT)
+BORTLE_BG = {
+    1: (0,   0,   0),      # black
+    2: (50,  50,  50),     # gray
+    3: (0,   0,   255),    # blue
+    4: (0,   255, 0),      # green
+    5: (255, 255, 0),      # yellow
+    6: (255, 140, 0),      # orange
+    7: (255, 0,   0),      # red
+    8: (255, 0,   180),    # pink/magenta
+    9: (255, 255, 255),    # white
+}
+
+# 3x5 digit font
+DIGITS_3x5 = {
+    0: [0b111,0b101,0b101,0b101,0b111],
+    1: [0b010,0b110,0b010,0b010,0b111],
+    2: [0b111,0b001,0b111,0b100,0b111],
+    3: [0b111,0b001,0b111,0b001,0b111],
+    4: [0b101,0b101,0b111,0b001,0b001],
+    5: [0b111,0b100,0b111,0b001,0b111],
+    6: [0b111,0b100,0b111,0b101,0b111],
+    7: [0b111,0b001,0b010,0b010,0b010],
+    8: [0b111,0b101,0b111,0b101,0b111],
+    9: [0b111,0b101,0b111,0b001,0b111],
+}
+
+def draw_digit_centered(d, rgb=(255, 255, 255), k=DIGIT_BRIGHT):
+    d = int(d)
+    glyph = DIGITS_3x5.get(d)
+    if glyph is None:
+        return
+    fg = scale(rgb, k)
+    # Center 3x5 in 8x8: x=2..4, y=1..5
+    x0, y0 = 2, 1
+    for r in range(5):
+        bits = glyph[r]
+        for c in range(3):
+            if (bits >> (2 - c)) & 1:
+                np[xy_to_i(x0 + c, y0 + r)] = fg
+
+def show_bortle(b):
+    b = int(max(1, min(9, b)))
+    fill(BORTLE_BG[b], BG_BRIGHT)
+    draw_digit_centered(b, (255, 255, 255), DIGIT_BRIGHT)
+    np.write()
+
+# ----------------------------
+# TSL25911 (TSL2591-family) driver
+# ----------------------------
+
+class TSL25911:
+    # Registers (TSL2591 family style)
+    _ADDR = 0x29
+    _CMD  = 0xA0  # command bit | auto-increment
+
+    REG_ENABLE   = 0x00
+    REG_CONTROL  = 0x01
+    REG_CHAN0_L  = 0x14
+    REG_CHAN1_L  = 0x16
+
+    ENABLE_PON   = 0x01
+    ENABLE_AEN   = 0x02
+
+    # Gain values (AGAIN) and multipliers (approx standard TSL2591)
+    GAIN_MAP = [
+        (0x00, 1),
+        (0x01, 25),
+        (0x02, 428),
+        (0x03, 9876),
+    ]
+
+    # Integration time (ATIME) options:
+    # ATIME register value; integration time = (256 - ATIME) * 2.73ms
+    ATIME_OPTIONS = [
+        (0xFF, 2.73),
+        (0xF6, 27.3),
+        (0xD5, 100.0),
+        (0xC0, 200.0),
+        (0x00, 700.0),
+    ]
+
+    def __init__(self, i2c, address=_ADDR):
+        self.i2c = i2c
+        self.addr = address
+
+        # start at moderate settings
+        self.atime = 0xC0  # ~200ms
+        self.gain_idx = 1  # 25x
+
+        self._enable()
+        self.set_timing_gain(self.atime, self.gain_idx)
+
+    def _w8(self, reg, val):
+        self.i2c.writeto_mem(self.addr, self._CMD | reg, bytes([val & 0xFF]))
+
+    def _r8(self, reg):
+        return self.i2c.readfrom_mem(self.addr, self._CMD | reg, 1)[0]
+
+    def _r16(self, reg_l):
+        b = self.i2c.readfrom_mem(self.addr, self._CMD | reg_l, 2)
+        return b[0] | (b[1] << 8)
+
+    def _enable(self):
+        # Power on + ALS enable
+        self._w8(self.REG_ENABLE, self.ENABLE_PON)
+        time.sleep_ms(5)
+        self._w8(self.REG_ENABLE, self.ENABLE_PON | self.ENABLE_AEN)
+        time.sleep_ms(5)
+
+    def set_timing_gain(self, atime, gain_idx):
+        self.atime = atime
+        self.gain_idx = max(0, min(3, gain_idx))
+        gain_reg, _ = self.GAIN_MAP[self.gain_idx]
+        # CONTROL: (AGAIN << 4) | ATIME (some variants use different packing;
+        # this matches common TSL2591 drivers: CONTROL lower bits for ATIME, upper for gain)
+        # Many boards accept CONTROL = (gain << 4) | atime
+        self._w8(self.REG_CONTROL, ((gain_reg & 0x03) << 4) | (self.atime & 0xFF))
+        # wait for integration to produce fresh data
+        time.sleep_ms(int(self.integration_ms() + 10))
+
+    def integration_ms(self):
+        # compute from atime
+        return (256 - self.atime) * 2.73
+
+    def gain_mult(self):
+        return self.GAIN_MAP[self.gain_idx][1]
+
+    def read_channels(self):
+        ch0 = self._r16(self.REG_CHAN0_L)
+        ch1 = self._r16(self.REG_CHAN1_L)
+        return ch0, ch1
+
+    def auto_range_read(self, target_low=200, target_high=50000, max_iters=6):
+        """
+        Auto-adjust gain/integration to keep channel0 within a useful range.
+        Returns (ch0, ch1, atime_ms, gain_mult)
+        """
+        for _ in range(max_iters):
+            ch0, ch1 = self.read_channels()
+
+            # Detect saturation-ish (16-bit max)
+            if ch0 >= 65000 or ch1 >= 65000:
+                # too bright -> reduce sensitivity
+                if self.gain_idx > 0:
+                    self.set_timing_gain(self.atime, self.gain_idx - 1)
+                    continue
+                # reduce integration if possible
+                if self.atime != 0xFF:
+                    # step to shorter integration (choose next shorter option)
+                    self._step_integration(shorter=True)
+                    continue
+                return ch0, ch1, self.integration_ms(), self.gain_mult()
+
+            # Too dim -> increase sensitivity
+            if ch0 < target_low:
+                if self.atime != 0x00:
+                    self._step_integration(shorter=False)
+                    continue
+                if self.gain_idx < 3:
+                    self.set_timing_gain(self.atime, self.gain_idx + 1)
+                    continue
+                return ch0, ch1, self.integration_ms(), self.gain_mult()
+
+            # Too bright but not saturated -> decrease sensitivity
+            if ch0 > target_high:
+                if self.gain_idx > 0:
+                    self.set_timing_gain(self.atime, self.gain_idx - 1)
+                    continue
+                if self.atime != 0xFF:
+                    self._step_integration(shorter=True)
+                    continue
+
+            # In range
+            return ch0, ch1, self.integration_ms(), self.gain_mult()
+
+        # fallback
+        ch0, ch1 = self.read_channels()
+        return ch0, ch1, self.integration_ms(), self.gain_mult()
+
+    def _step_integration(self, shorter):
+        # Move to next integration preset
+        opts = [v for v, _ in self.ATIME_OPTIONS]
+        idx = opts.index(self.atime) if self.atime in opts else 3  # default to ~200ms slot
+        if shorter:
+            idx = max(0, idx - 1)
         else:
-            self.ema = EMA_ALPHA * lux + (1 - EMA_ALPHA) * self.ema
-        
-        # Update rolling average
-        self.history.append(lux)
-        rolling_avg = sum(self.history) / len(self.history)
-        
-        return self.ema, rolling_avg
+            idx = min(len(opts) - 1, idx + 1)
+        self.set_timing_gain(opts[idx], self.gain_idx)
 
+    def lux_like(self, ch0, ch1, atime_ms, gain_mult):
+        """
+        A lux-like scalar (good for log mapping), using a common TSL2591-style formula.
+        We primarily need a monotonic brightness metric for calibration.
+        """
+        # Avoid division by zero / nonsense
+        if ch0 <= 0:
+            return 1e-6
 
-# ========== BORTLE SCALE CALCULATION ==========
+        # "Counts per lux" factor (CPL) from common TSL2591 implementations
+        LUX_DF = 408.0
+        cpl = (atime_ms * gain_mult) / LUX_DF
+        if cpl <= 0:
+            return 1e-6
 
-def calculate_bortle_scale(lux):
-    """Convert lux reading to Bortle scale (1-9)"""
-    if lux is None or lux < 0:
-        return None
-    
-    for threshold, scale in BORTLE_SCALE:
-        if lux < threshold:
-            return scale
-    
+        # IR-corrected term (common approach)
+        # lux = ( (ch0 - ch1) * (1 - (ch1 / ch0)) ) / cpl
+        ir = ch1 / ch0
+        lux = ((ch0 - ch1) * (1.0 - ir)) / cpl
+        if lux <= 0:
+            # still return something usable for log mapping
+            return max((ch0 - ch1) / cpl, 1e-6)
+        return lux
+
+# ----------------------------
+# Bortle classification
+# ----------------------------
+
+def classify_bortle_from_sqm(sqm):
+    # Higher SQM = darker = lower Bortle number
+    if sqm >= 21.76: return 1
+    if sqm >= 21.60: return 2
+    if sqm >= 21.30: return 3
+    if sqm >= 20.80: return 4
+    if sqm >= 20.30: return 5
+    if sqm >= 19.25: return 6
+    if sqm >= 18.50: return 7
+    if sqm >= 18.00: return 8
     return 9
 
+# ----------------------------
+# Main: I2C init, sensor, loop
+# ----------------------------
 
-# ========== MAIN LOOP ==========
+# I2C bus on GPIO6/7 (matches Waveshare example)
+i2c = I2C(1, sda=Pin(6), scl=Pin(7), freq=100_000)
 
-def main():
-    print("\n" + "="*40)
-    print("Sky Quality Meter - RP2040-Zero")
-    print("="*40 + "\n")
-    
-    # Initialize hardware
-    hw = Hardware()
-    reader = LuxReader(hw)
-    
-    # Timing
-    next_loop = time.monotonic()
-    init_failures = 0
-    
-    # Main loop
-    while True:
-        try:
-            # Read sensor
-            lux = reader.read()
-            
-            if lux is None:
-                # Sensor failed - try reinit
-                init_failures += 1
-                print(f"⟳ Reinitializing sensor (attempt {init_failures}/{MAX_INIT_FAILURES})...")
-                
-                if init_failures >= MAX_INIT_FAILURES:
-                    print("✗ Sensor permanently failed - entering safe mode")
-                    hw.set_leds(9)  # All red
-                    while True:
-                        hw.heartbeat_blink()
-                        time.sleep(1)
-                
-                hw.init_sensor()
-                time.sleep(0.5)
-                continue
-            
-            # Reset failure counter on successful read
-            init_failures = 0
-            
-            # Apply smoothing
-            ema, rolling_avg = reader.smooth(lux)
-            
-            # Calculate Bortle scale
-            bortle = calculate_bortle_scale(ema)
-            
-            # Update LEDs
-            hw.set_leds(bortle)
-            
-            # Display readings
-            print(f"Lux: {lux:.3f} | Avg: {rolling_avg:.3f} | EMA: {ema:.3f} | Bortle: {bortle}")
-            print(f"RAM: {gc.mem_free()} bytes\n")
-            
-            # Heartbeat pulse
-            hw.heartbeat_blink()
-            
-            # Sleep until next reading (precise timing)
-            next_loop += LOOP_INTERVAL
-            sleep_time = next_loop - time.monotonic()
-            
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-            else:
-                # We're running behind - reset timing
-                next_loop = time.monotonic()
-            
-            # Feed watchdog at end of successful loop
-            microcontroller.watchdog.feed()
-            
-        except Exception as e:
-            print(f"✗ Loop error: {e}")
-            # Don't feed watchdog - let it reset if error persists
-            time.sleep(1)
+# Optional: uncomment once to verify the sensor is visible (should include 0x29)
+# print([hex(a) for a in i2c.scan()])
 
+sensor = TSL25911(i2c, address=0x29)
 
-# ========== ENTRY POINT ==========
+ema_sqm = None
 
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        # Critical error - log and halt
-        print(f"\n{'='*40}")
-        print(f"CRITICAL ERROR: {e}")
-        print(f"{'='*40}\n")
-        
-        try:
-            with open("/error_log.txt", "a") as log:
-                log.write(f"\n--- Error at {time.monotonic()}s ---\n")
-                log.write(f"{e}\n")
-        except:
-            pass
-        
-        # Halt with all LEDs on
-        while True:
-            time.sleep(1)
+while True:
+    # 1) Read sensor with auto-ranging
+    ch0, ch1, at_ms, gain = sensor.auto_range_read()
+
+    # 2) Convert to a monotonic brightness metric
+    raw = sensor.lux_like(ch0, ch1, at_ms, gain)
+    raw = max(raw, 1e-6)
+
+    # 3) SQM-like conversion (log)
+    sqm = CAL_A * math.log10(raw) + CAL_B
+
+    # 4) Smooth to reduce flicker
+    if ema_sqm is None:
+        ema_sqm = sqm
+    else:
+        ema_sqm = EMA_ALPHA * ema_sqm + (1.0 - EMA_ALPHA) * sqm
+
+    # 5) Classify to Bortle 1..9
+    bortle = classify_bortle_from_sqm(ema_sqm)
+
+    # 6) Display: color background + centered white digit
+    show_bortle(bortle)
+
+    time.sleep(UPDATE_PERIOD)
